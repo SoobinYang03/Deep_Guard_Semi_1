@@ -269,3 +269,6 @@ docker-compose down -v
 ### Elasticsearch
 - URL: `http://localhost:9200`
 - 인증: 비활성화 (개발 환경)
+
+  ⚠️ 주의: 최초 커밋 시 Git 에러 때문에 공용 레포에서 venv 폴더는 제외했습니다.
+레포를 클론한 뒤에는 각자 로컬 환경에서 python -m venv venv로 가상환경을 다시 생성한 후, pip install -r requirements.txt를 실행해 주세요.
