@@ -1,0 +1,16 @@
+Employee_ID	Name	Department	Position	Salary	Join_Date	Email
+E001	Gil-dong Hong	Engineering	Senior Developer	75000000	2020-03-15	hong.gildong@company.com
+E002	Young-hee Kim	Marketing	Marketing Manager	68000000	2019-07-22	kim.younghee@company.com
+E003	Chul-soo Park	Sales	Sales Representative	52000000	2021-01-10	park.chulsoo@company.com
+E004	Mi-na Yu	HR	HR Specialist	58000000	2020-11-05	yu.mina@company.com
+E005	Min-ho Lee	Engineering	DevOps Engineer	72000000	2021-06-18	lee.minho@company.com
+E006	Su-jin Kang	Finance	Financial Analyst	65000000	2019-09-30	kang.sujin@company.com
+E007	Ji-won Choi	Design	UI/UX Designer	63000000	2020-08-12	choi.jiwon@company.com
+E008	Dong-hyun Kim	Engineering	Junior Developer	48000000	2022-02-28	kim.donghyun@company.com
+E009	Hye-jin Park	Customer Support	Support Lead	55000000	2021-04-20	park.hyejin@company.com
+E010	Jae-min Yoon	Engineering	Tech Lead	85000000	2018-05-14	yoon.jaemin@company.com
+E011	Seo-yeon Lee	Marketing	Content Strategist	60000000	2020-12-01	lee.seoyeon@company.com
+E012	Tae-yang Kim	Sales	Sales Manager	78000000	2019-03-25	kim.taeyang@company.com
+E013	Bo-ra Choi	HR	Recruiter	51000000	2022-01-15	choi.bora@company.com
+E014	Ji-hoon Park	Engineering	QA Engineer	62000000	2021-09-08	park.jihoon@company.com
+E015	Yuna Jung	Finance	Accountant	56000000	2020-07-03	jung.yuna@company.com

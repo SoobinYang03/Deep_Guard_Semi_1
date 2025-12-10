@@ -1,0 +1,51 @@
+version: '3.7'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node # 단일 노드로 실행 (클러스터 구성 X)
+      - xpack.security.enabled=false # 보안(HTTPS/로그인) 끄기
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m" # 메모리 사용량 제한
+    ports:
+      - "9200:9200" # HTTP REST API 포트
+    volumes:
+      - es_data:/usr/share/elasticsearch/data # 데이터 영구 저장
+    networks:
+      - elastic
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.1
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200 # ES와 연결
+    depends_on:
+      - elasticsearch
+    networks:
+      - elastic
+
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin123
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - elastic
+
+volumes:
+  es_data:
+    driver: local
+  mongo_data:
+    driver: local
+
+networks:
+  elastic:
+    driver: bridge
