@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom Scrollbar */
+::-webkit-scrollbar { 
+  width: 8px; 
+}
+
+::-webkit-scrollbar-track { 
+  background: #2D3748; 
+}
+
+::-webkit-scrollbar-thumb { 
+  background: #06B6D4; /* Cyan Accent */
+  border-radius: 4px; 
+}
+
+::-webkit-scrollbar-thumb:hover { 
+  background: #0891B2; 
+}
+
+/* Inter font for professional look */
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #111827; /* Very Dark Blue-Gray */
+  color: #F3F4F6; /* Light text */
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/* Custom Animation for Spinner */
+@keyframes spin { 
+  0% { transform: rotate(0deg); } 
+  100% { transform: rotate(360deg); } 
+}
+
+.spinner {
+  border-top-color: #06B6D4;
+  border-left-color: #06B6D4;
+  animation: spin 1s linear infinite;
+}
