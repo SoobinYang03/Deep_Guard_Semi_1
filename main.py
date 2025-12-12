@@ -1,10 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-import pandas as pd
-import json
+import hashlib
+import uuid
+import re
+import requests
+import urllib3
 import os
 import tempfile
+import json
+import pandas as pd
+from datetime import datetime  
+from pymongo import MongoClient
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from elasticsearch import Elasticsearch, helpers
+
+
 
 app = FastAPI()
 
@@ -347,3 +356,190 @@ async def search_all_indices(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def mask_text(text: str):
+    """
+    [기능] 맨 앞/뒤 글자 제외하고 나머지 * 처리 (예: admin -> a***n)
+    """
+    if not text or len(text) <= 2:
+        return text 
+    return text[0] + "*" * (len(text) - 2) + text[-1]
+
+def get_sha256(text: str):
+    """
+    [기능] 텍스트의 해시값(SHA-256) 생성
+    """
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+@app.post("/parse-file")
+async def parse_user_file(file: UploadFile = File(...)):
+    """
+    [기능] 파일(txt)을 읽어서 'email:password' 파싱 -> 마스킹 -> 해싱 -> JSON 반환
+    """
+    # 1. 파일 읽기
+    content = await file.read()
+    try:
+        text_data = content.decode("utf-8")
+    except:
+        text_data = content.decode("cp949", errors="ignore")
+
+    results = []
+    lines = text_data.splitlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        # 2. 파싱 
+        # 예: email:password 또는 url:email:password
+        if ":" in line:
+            parts = line.split(":")
+            
+            target_email = ""
+            target_pw = ""
+            
+            # 이메일 형식을 찾음 (@와 .이 있는 것)
+            for i, part in enumerate(parts):
+                if "@" in part and "." in part:
+                    target_email = part.strip()
+                    # 이메일 바로 뒤에 있는게 비밀번호일 확률 높음
+                    if i + 1 < len(parts):
+                        target_pw = parts[i+1].strip()
+                    break
+            
+            # 이메일을 찾았다면 처리 시작
+            if target_email:
+                # ID 부분만 추출 (admin@gmail.com -> admin)
+                try:
+                    email_id, email_domain = target_email.split("@", 1)
+                except:
+                    email_id = target_email
+                    email_domain = ""
+
+                # 3. 마스킹 & 해싱 (민정님 요청)
+                masked_id = mask_text(email_id)
+                masked_pw = mask_text(target_pw)
+                email_hash = get_sha256(target_email)
+
+                # 4. JSON 구조 만들기
+                entry = {
+                    "id": str(uuid.uuid4()),                        # 고유 ID
+                    "original_hash": email_hash,                    # 식별용 해시
+                    "masked_email": f"{masked_id}@{email_domain}",  # 보여주기용
+                    "masked_password": masked_pw,                   # 보여주기용
+                    "raw_text": line,                               # 원본 데이터
+                    "status": "Ready for Crawling"                  # 상태 표시
+                }
+                results.append(entry)
+
+    # 5. 최종 결과 반환
+    return {
+        "status": "success",
+        "file_name": file.filename,
+        "total_parsed": len(results),
+        "data": results
+    }
+
+def check_ransomware_risk(domain_keyword: str):
+    url = "https://api.ransomware.live/v2/recentvictims"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=5)
+        if response.status_code != 200:
+            return {"status": "Error", "message": "API Error"}
+            
+        data = response.json()
+        
+        for item in data:
+            victim = item.get('victim', '').lower()
+            if domain_keyword.lower() in victim:
+                return {
+                    "is_leaked": True,
+                    "victim_name": item.get('victim'),
+                    "group": item.get('group'),
+                    "date": item.get('attackdate'),
+                    "screenshot": item.get('screenshot', ''),
+                    "risk_level": "Critical"
+                }
+        return {"is_leaked": False, "risk_level": "Safe"}
+
+    except Exception as e:
+        return {"is_leaked": False, "error": str(e)}
+
+def mask_text(text: str):
+    if not text or len(text) <= 2: return text 
+    return text[0] + "*" * (len(text) - 2) + text[-1]
+
+def get_sha256(text: str):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+@app.post("/analyze-file")
+async def analyze_uploaded_file(file: UploadFile = File(...)):
+    content = await file.read()
+    try:
+        text_data = content.decode("utf-8")
+    except:
+        text_data = content.decode("cp949", errors="ignore")
+
+    results = []
+    lines = text_data.splitlines()
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        if ":" in line:
+            parts = line.split(":")
+            target_email = ""
+            target_pw = ""
+            
+            for i, part in enumerate(parts):
+                if "@" in part and "." in part:
+                    target_email = part.strip()
+                    if i + 1 < len(parts):
+                        target_pw = parts[i+1].strip()
+                    break
+            
+            if target_email:
+                try:
+                    email_id, email_domain = target_email.split("@", 1)
+                    company_keyword = email_domain.split('.')[0]
+                except:
+                    email_id = target_email
+                    email_domain = ""
+                    company_keyword = target_email
+
+                osint_result = check_ransomware_risk(company_keyword)
+
+                entry = {
+                    "id": str(uuid.uuid4()),
+                    "original_hash": get_sha256(target_email),
+                    "masked_email": f"{mask_text(email_id)}@{email_domain}",
+                    "masked_password": mask_text(target_pw),
+                    "domain": email_domain,
+                    "osint_result": osint_result,
+                    "raw_text": line,
+                    "status": "Analyzed",
+                    "created_at": str(datetime.now())
+                }
+                
+                try:
+                    es.index(index="leaked_data", body=entry)
+                    if 'mongo_collection' in globals():
+                        mongo_collection.insert_one(entry.copy())
+                except Exception as e:
+                    print(f"DB Error: {e}")
+
+                if "_id" in entry: del entry["_id"]
+                results.append(entry)
+
+    return {
+        "status": "success",
+        "file_name": file.filename,
+        "total_parsed": len(results),
+        "data": results
+    }
+
