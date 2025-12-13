@@ -12,6 +12,8 @@ from pymongo import MongoClient
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from elasticsearch import Elasticsearch, helpers
+from app.notifications.email import send_leak_alert  # 이메일 알림
+
 
 
 
@@ -532,6 +534,15 @@ async def analyze_uploaded_file(file: UploadFile = File(...)):
                         mongo_collection.insert_one(entry.copy())
                 except Exception as e:
                     print(f"DB Error: {e}")
+                # 이메일 알림 트리거 (domain 기반 간단 알림)
+                try:
+                    await send_leak_alert(
+                        domain=email_domain,
+                        masked_email=entry["masked_email"],
+                        risk_level=entry["osint_result"].get("risk_level", "Unknown")
+                    )
+                except Exception as e:
+                    print(f"Email Error: {e}")
 
                 if "_id" in entry: del entry["_id"]
                 results.append(entry)
