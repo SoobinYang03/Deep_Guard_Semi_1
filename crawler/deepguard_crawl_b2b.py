@@ -361,46 +361,67 @@ def search_ransomware(target_companies):
     return results
 
 #컨트롤러
-async def main_controller(email, keyword):
+async def main_controller(email_list, keyword=None):
     all_findings = []
 
-    domain, company = parse_company_info(email)
-    if not domain:
-        print("잘못된 이메일 형식입니다.")
-        return []
+    #중복된 내용은 제거
+    deduplicate_domains = set()
+    deduplicate_companies = set()
 
-    print(f"DeepGuard 진단 시작: {company} ({domain}) ===")
+    if isinstance(email_list, str):
+        email_list = [email_list]
 
-    competitors = get_competitors_by_ai(company)
-    ransomware_targets = [company] + competitors
+    email_mapping = {}
 
+    #데이터 1차 가공.(이메일주소, 중복도메인 제거, 중복회사명 제거)
+    for email in email_list:
+        domain, company = parse_company_info(email)
+        if domain and company:
+            deduplicate_domains.add(domain)
+            deduplicate_companies.add(company)
+            email_mapping[email] = {'domain' : domain, 'company' : company}
+
+    #태그 붙여서 데이터 포맷에 추가
     def add_tag(results_list, tag_name):
         for item in results_list:
             item['keyword_type'] = tag_name
         return results_list
 
-    print(">>> 텔레그램 세션 연결 중...")
+    print(">>> 텔레그램 세션 연결 중")
     async with TelegramClient(tg_session, tg_api_id, tg_api_hash) as client:
 
-        res = await search_telegram(client, email, "credential")
-        all_findings.extend(add_tag(res, "credential"))
+        print(f"[Layer 1] 이메일 기반 유출 분석 {len(email_list)}회")
+        for email in email_list: 
+            res = await search_telegram(client, email, "credential")
+            all_findings.extend(add_tag(res, "credential"))
 
-        res = await search_surface_mirroring(email)
-        all_findings.extend(add_tag(res, "credential"))
+            res = await search_surface_mirroring(email)
+            all_findings.extend(add_tag(res, "credential"))
 
-        res = search_darkweb(email)
-        all_findings.extend(add_tag(res, "credential"))
+            res = search_darkweb(email)
+            all_findings.extend(add_tag(res, "credential"))
 
-        res = await search_telegram(client, domain, "asset")
-        all_findings.extend(add_tag(res, "asset"))
+        print(f"[Layer 2] 도메인 기반 유출 분석 {len(deduplicate_domains)}회")
+        for domain in deduplicate_domains: 
+            res = await search_telegram(client, domain, "asset") 
+            all_findings.extend(add_tag(res, "asset"))
 
-        res = await search_surface_mirroring(domain)
-        all_findings.extend(add_tag(res, "asset"))
+            res = await search_surface_mirroring(domain)
+            all_findings.extend(add_tag(res, "asset"))
 
-        res = search_darkweb(domain)
-        all_findings.extend(add_tag(res, "asset"))
+            res = search_darkweb(domain)
+            all_findings.extend(add_tag(res, "asset"))
 
-        if project_keywords:
+        print(f"[Layer 3] 회사명 기반 랜섬웨어 분석 {len(deduplicate_companies)}회")
+        for company in deduplicate_companies:
+            competitors = get_competitors_by_ai(company)
+            ransomware_targets = [company] + competitors
+            
+            res = search_ransomware(ransomware_targets)
+            all_findings.extend(add_tag(res, "company"))
+
+        if keyword:
+            print(f"[Layer 4] 프로젝트 키워드 분석: {keyword}")
 
             res = await search_telegram(client, keyword, "project")
             all_findings.extend(add_tag(res, "project"))
@@ -411,14 +432,13 @@ async def main_controller(email, keyword):
             res = search_darkweb(keyword)
             all_findings.extend(add_tag(res, "project"))
 
-        res = search_ransomware(ransomware_targets)
-        all_findings.extend(add_tag(res, "company"))
-
     return all_findings
 
 # 실행부
 if __name__ == "__main__":
-    input_email = "buygame@g2a.com"
+    input_email = [
+        "buygame@g2a.com"
+    ]
     input_keyword = "galaxy"
 
     try:
@@ -438,3 +458,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"오류 발생: {e}")
+
