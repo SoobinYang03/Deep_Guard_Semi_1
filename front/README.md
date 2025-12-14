@@ -38,5 +38,5 @@ npm run build
 `.env` 파일을 생성하여 백엔드 API 주소를 설정하세요:
 
 ```env
-REACT_APP_API_URL=http://localhost:5000
+REACT_APP_API_URL=http://localhost:8000
 ```

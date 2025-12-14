@@ -1,6 +1,6 @@
 # app/notifications/email.py
 import smtplib
-from email.mime.text import MimeText
+from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from app.config import SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, ADMIN_EMAILS
 
@@ -17,7 +17,7 @@ async def send_leak_alert(domain: str, masked_email: str, risk_level: str):
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["Subject"] = subject
-    msg.attach(MimeText(body, "plain", "utf-8"))
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
     server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
     server.starttls()
