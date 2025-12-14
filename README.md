@@ -147,7 +147,6 @@ GET /health
 ### API 문서 확인
 
 - Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
 
 ## 데이터베이스 스키마
 
