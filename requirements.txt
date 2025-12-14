@@ -4,3 +4,6 @@ python-multipart==0.0.6
 pandas==2.2.0
 elasticsearch==8.12.0
 pymongo==4.6.1
+requests==2.31.0
+urllib3==2.1.0
+python-dotenv==1.0.0
