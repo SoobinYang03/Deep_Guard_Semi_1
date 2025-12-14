@@ -56,14 +56,14 @@ python -m venv venv
 # or
 python3 -m venv venv
 
+# 가상환경 활성화 (Mac/Linux)
+source venv/bin/activate
 
 # 패키지 설치
 pip install -r requirements.txt
 #or
 pip3 install -r requirements.txt
 
-# 가상환경 활성화 (Mac/Linux)
-source venv/bin/activate
 ```
 
 ### 3. MongoDB 스키마 생성
