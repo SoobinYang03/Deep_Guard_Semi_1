@@ -3,8 +3,10 @@ from datetime import datetime
 
 # MongoDB 연결
 client = MongoClient("mongodb://admin:admin123@localhost:27017/")
+#이전 데이터베이스 삭제
+client.drop_database('leak_database')
+print("leak_database가 삭제되었습니다.")
 db = client["leak_database"]
-
 # 1. Source 컬렉션 스키마
 source_schema = {
     "$jsonSchema": {
@@ -17,7 +19,7 @@ source_schema = {
             },
             "type": {
                 "bsonType": "string",
-                "enum": ["social", "darkweb", "forum", "paste_site", "other"],
+                "enum": ["darkweb", "surfaceweb", "telegram"],
                 "description": "출처 타입 (필수)"
             },
             "description": {
@@ -29,9 +31,9 @@ source_schema = {
                 "enum": ["active", "inactive", "monitored"],
                 "description": "상태"
             },
-            "created_at": {
+            "updated_at": {
                 "bsonType": "date",
-                "description": "생성 시각"
+                "description": "수정 시각"
             }
         }
     }
@@ -71,6 +73,11 @@ leaks_schema = {
             "updated_at": {
                 "bsonType": ["date", "null"],
                 "description": "수정 시각"
+            },
+            "status": {
+                "bsonType": ["string", "null"],
+                "enum": ["new", "processing", "investigating", "resolved", None],
+                "description": "상태"
             }
         }
     }
@@ -80,7 +87,7 @@ leaks_schema = {
 file_schema = {
     "$jsonSchema": {
         "bsonType": "object",
-        "required": ["leak_id", "file_name"],
+        "required": ["leak_id", "file_name", "index_name"],
         "properties": {
             "leak_id": {
                 "bsonType": "objectId",
@@ -90,9 +97,9 @@ file_schema = {
                 "bsonType": "string",
                 "description": "파일명 (필수)"
             },
-            "file_path": {
-                "bsonType": ["string", "null"],
-                "description": "파일 저장 경로"
+            "index_name": {
+                "bsonType": "string",
+                "description": "Elasticsearch 인덱스 이름 (필수)"
             },
             "file_type": {
                 "bsonType": ["string", "null"],
@@ -116,9 +123,9 @@ file_schema = {
 
 # 컬렉션 생성 및 스키마 적용
 collections_config = [
-    ("source", source_schema),
+    ("sources", source_schema),
     ("leaks", leaks_schema),
-    ("file", file_schema)
+    ("files", file_schema)
 ]
 
 for collection_name, schema in collections_config:
