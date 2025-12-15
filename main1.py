@@ -1,88 +1,78 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse
 import pandas as pd
+import json
 import os
 import tempfile
-from typing import List, Dict, Any, Optional
-
 from elasticsearch import Elasticsearch, helpers
 
-# ✅ analyzer import
-import deepguard_analyzer as dga
+import deepguard_analyzer as dga  # ✅ analyzer import
 
 app = FastAPI()
 
-ES_URL = os.getenv("ES_URL", "http://localhost:9200").strip()
-DEFAULT_INDEX = os.getenv("DG_ES_INDEX", "deepguard_hits").strip()
-
-# 테이블 파일(CSV/TSV/JSON/NDJSON)일 때 row 단위 분석 최대치
-DG_MAX_ROWS = int(os.getenv("DG_MAX_ROWS", "2000"))
-
 es = Elasticsearch(
-    ES_URL,
+    "http://localhost:9200",
     verify_certs=False
 )
 
-def load_file_to_dataframe(file_path: str, content_type: Optional[str]) -> pd.DataFrame:
-    """파일을 DataFrame으로 변환"""
+# -------------------------
+# 파일을 DataFrame으로 변환
+# -------------------------
+def load_file_to_dataframe(file_path, content_type):
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
-    ct = (content_type or "").lower()
 
-    if ext == ".csv" or ct == "text/csv":
+    if ext == ".csv" or content_type == "text/csv":
         df = pd.read_csv(file_path)
-    elif ext == ".tsv" or ct == "text/tab-separated-values":
+    elif ext == ".tsv" or content_type == "text/tab-separated-values":
         df = pd.read_csv(file_path, sep="\t")
-    elif ext == ".json" or ct == "application/json":
+    elif ext == ".json" or content_type == "application/json":
         df = pd.read_json(file_path)
-    elif ext == ".ndjson":
+    elif ext in (".ndjson", ".jsonl"):
         df = pd.read_json(file_path, lines=True)
     else:
         raise ValueError(f"지원하지 않는 파일 형식입니다: {ext}")
 
     return df.fillna("")
 
-def dataframe_row_to_text(row: pd.Series) -> str:
-    """DataFrame row를 analyzer에 넣을 텍스트로 변환"""
-    # key=value 형태로 만들면 탐지에 유리함
-    parts = []
-    for k, v in row.to_dict().items():
-        s = str(v)
-        if not s:
-            continue
-        parts.append(f"{k}={s}")
-    return "\n".join(parts)
+def doc_generator(docs, index_name):
+    for doc in docs:
+        yield {"_index": index_name, "_source": doc}
 
-def bulk_actions(index_name: str, docs: List[Dict[str, Any]]):
-    """ES bulk actions generator"""
-    for d in docs:
-        _id = d.get("id")
-        action = {
-            "_index": index_name,
-            "_source": d
-        }
-        if _id:
-            action["_id"] = _id
-        yield action
+def df_to_text_rows(df: pd.DataFrame, max_rows: int = 2000) -> list[str]:
+    rows = []
+    for i, row in df.head(max_rows).iterrows():
+        parts = []
+        for k, v in row.items():
+            parts.append(f"{k}: {v}")
+        rows.append("\n".join(parts))
+    return rows
 
+# -------------------------
+# Upload -> (Analyzer optional) -> ES bulk
+# -------------------------
 @app.post("/upload")
 async def upload_to_elasticsearch(
     file: UploadFile = File(...),
     index_name: str = None,
-    analyze: bool = True,
-    mask: Optional[bool] = None
+    analyze: bool = Query(True, description="true면 analyzer 실행 후 적재, false면 원본 그대로 적재"),
+    mask: bool = Query(True, description="analyze=true일 때 마스킹 적용 여부"),
+    row_mode: bool = Query(True, description="csv/tsv/json/ndjson이면 row 단위 분석할지 여부"),
 ):
     """
-    파일 업로드 → (옵션) DeepGuard Analyzer 분석 → ES bulk 적재
-    - file: TXT/CSV/TSV/JSON/NDJSON
-    - index_name: 없으면 DEFAULT_INDEX 사용
-    - analyze: True면 analyzer 호출해서 "통일 포맷" docs 생성 후 적재
-    - mask: True/False 지정 시 analyzer 마스킹 강제, None이면 DG_MASK 환경변수 따름
+    - analyze=false: 기존처럼 파일 내용을 그대로 ES에 업로드
+    - analyze=true: 업로드 파일을 text로 읽어 deepguard_analyzer로 분석 후, 저장 대상만 ES bulk 적재
+      * 저장 미달이어도 verdict/reason을 API 응답에 포함
     """
     tmp_file_path = None
+
+    # 마지막 판정/사유 (저장 0건일 때도 응답에 넣기)
+    last_verdict = None
+    last_reason = None
+
     try:
         if index_name is None:
-            index_name = DEFAULT_INDEX
+            index_name = os.path.splitext(file.filename)[0]
 
         # 임시 파일 생성
         suffix = os.path.splitext(file.filename)[1]
@@ -92,123 +82,123 @@ async def upload_to_elasticsearch(
             tmp_file_path = tmp_file.name
 
         ext = suffix.lower()
-        ct = (file.content_type or "").lower()
 
-        docs_to_ingest: List[Dict[str, Any]] = []
+        # -------------------------
+        # analyze = false (원본 그대로 업로드)
+        # -------------------------
+        if not analyze:
+            df = load_file_to_dataframe(tmp_file_path, file.content_type)
+            success, failed = helpers.bulk(es, (
+                {"_index": index_name, "_source": row.to_dict()} for _, row in df.iterrows()
+            ))
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "업로드 성공 (analyze=false, raw ingest)",
+                    "index_name": index_name,
+                    "success": success,
+                    "failed": failed,
+                    "total_records": len(df),
+                    "analyze": analyze
+                }
+            )
+
+        # -------------------------
+        # analyze = true (Analyzer -> docs -> bulk ingest)
+        # -------------------------
+        docs_to_ingest = []
         analyzed_rows = 0
         skipped_rows = 0
 
-        # 1) 테이블류: row 단위 분석(여러건 저장에 유리)
-        if ext in (".csv", ".tsv", ".json", ".ndjson") or ct in ("text/csv", "text/tab-separated-values", "application/json"):
-            df = load_file_to_dataframe(tmp_file_path, file.content_type)
-
-            if not analyze:
-                # analyze=False면 그냥 원본을 그대로 적재(기존 기능 유지)
-                # (주의: 원본 스키마 그대로 들어감)
-                success, failed = helpers.bulk(es, ({"_index": index_name, "_source": r} for r in df.to_dict(orient="records")))
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "message": "업로드 성공 (analyze=False, raw ingest)",
-                        "index_name": index_name,
-                        "success": success,
-                        "failed": failed,
-                        "total_records": len(df),
-                    }
-                )
-
-            # analyze=True: row 단위로 analyzer 호출
-            max_rows = min(len(df), DG_MAX_ROWS)
-            for i in range(max_rows):
-                row_text = dataframe_row_to_text(df.iloc[i])
-                extra = {"file_row": i}
-                rows = dga.analyze_text(
-                    row_text,
-                    filename=file.filename,   # original_link는 파일명으로 고정
-                    mask=mask,
-                    extra_meta=extra
-                )
-                if rows:
-                    docs_to_ingest.extend(rows)
-                    analyzed_rows += 1
-                else:
-                    skipped_rows += 1
-
-        # 2) 텍스트류: 파일 전체를 한번에 분석
-        else:
-            # 텍스트 추정 (binary면 깨질 수 있으니 errors=ignore)
-            with open(tmp_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-
-            if not analyze:
-                # analyze=False면 "한 문서"로 원본 텍스트 적재
-                doc = {
-                    "id": file.filename,
-                    "source_id": "File",
-                    "original_link": file.filename,
-                    "raw_text": text[:20000],
-                    "ts": dga.utc_now_iso(),
-                    "note": "raw_ingest(analyze=False)"
-                }
-                success, failed = helpers.bulk(es, bulk_actions(index_name, [doc]))
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "message": "업로드 성공 (analyze=False, raw text ingest)",
-                        "index_name": index_name,
-                        "success": success,
-                        "failed": failed,
-                        "ingested": 1
-                    }
-                )
-
-            rows = dga.analyze_text(
-                text,
+        # 1) 텍스트 파일인 경우: 전체를 text로 분석
+        if ext in (".txt", ".log", ".md"):
+            text = content.decode("utf-8", errors="ignore")
+            meta = dga.analyze_text_with_meta(
+                text=text,
                 filename=file.filename,
                 mask=mask,
                 extra_meta={"file_mode": "full_text"}
             )
-            docs_to_ingest.extend(rows)
-            analyzed_rows = 1 if rows else 0
+            docs_to_ingest.extend(meta["saved_rows"])
+            analyzed_rows = 1
+            last_verdict = meta["verdict"]
+            last_reason = meta["reason"]
 
-        # analyzer 결과가 없으면 적재 없음
-        if not docs_to_ingest:
+        # 2) 테이블 파일인 경우: df 로딩 후 row 단위 분석 or 전체 합쳐 분석
+        else:
+            df = load_file_to_dataframe(tmp_file_path, file.content_type)
+
+            if row_mode:
+                rows = df_to_text_rows(df, max_rows=5000)
+                for i, row_text in enumerate(rows):
+                    meta = dga.analyze_text_with_meta(
+                        text=row_text,
+                        filename=file.filename,
+                        mask=mask,
+                        extra_meta={"file_row": i}
+                    )
+                    if meta["saved_rows"]:
+                        docs_to_ingest.extend(meta["saved_rows"])
+                        analyzed_rows += 1
+                    else:
+                        skipped_rows += 1
+                        last_verdict = meta["verdict"]
+                        last_reason = meta["reason"]
+            else:
+                # 전체를 하나의 text로 합쳐서 분석
+                big_text = "\n\n".join(df_to_text_rows(df, max_rows=5000))
+                meta = dga.analyze_text_with_meta(
+                    text=big_text,
+                    filename=file.filename,
+                    mask=mask,
+                    extra_meta={"file_mode": "merged_rows"}
+                )
+                docs_to_ingest.extend(meta["saved_rows"])
+                analyzed_rows = 1
+                last_verdict = meta["verdict"]
+                last_reason = meta["reason"]
+
+        # 실제 bulk 적재
+        if docs_to_ingest:
+            success, failed = helpers.bulk(es, doc_generator(docs_to_ingest, index_name))
             return JSONResponse(
                 status_code=200,
                 content={
-                    "message": "분석 완료 - 저장 조건 미달(적재 없음)",
-                    "hint": "DG_DEBUG=1로 실행하면 analyzer가 왜 스킵했는지 로그로 출력합니다.",
+                    "message": "분석+적재 성공",
                     "index_name": index_name,
                     "uploaded_file": file.filename,
                     "analyze": analyze,
                     "mask": mask,
-                    "analyzer_docs": 0,
+                    "analyzer_docs": len(docs_to_ingest),
+                    "bulk_success": success,
+                    "bulk_failed": failed,
                     "analyzed_rows": analyzed_rows,
-                    "skipped_rows": skipped_rows
+                    "skipped_rows": skipped_rows,
+                    "reason": last_reason,
+                    "verdict": last_verdict,
                 }
             )
 
-        # ES bulk 적재
-        success, failed = helpers.bulk(es, bulk_actions(index_name, docs_to_ingest))
-
+        # 저장(적재) 대상이 0건인 경우도 reason/verdict 포함
         return JSONResponse(
             status_code=200,
             content={
-                "message": "업로드+분석+적재 성공",
+                "message": "분석 완료 - 저장 조건 미달(적재 없음)",
                 "index_name": index_name,
                 "uploaded_file": file.filename,
                 "analyze": analyze,
                 "mask": mask,
-                "success": success,
-                "failed": failed,
-                "analyzer_docs": len(docs_to_ingest),
+                "analyzer_docs": 0,
                 "analyzed_rows": analyzed_rows,
-                "skipped_rows": skipped_rows
+                "skipped_rows": skipped_rows,
+                "reason": last_reason,
+                "verdict": last_verdict,
             }
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         if tmp_file_path and os.path.exists(tmp_file_path):
             try:
@@ -216,9 +206,13 @@ async def upload_to_elasticsearch(
             except Exception:
                 pass
 
+
+# -------------------------
+# API 상태 확인
+# -------------------------
 @app.get("/")
 async def root():
-    return {"message": "DeepGuard Upload+Analyzer API", "status": "running"}
+    return {"message": "Elasticsearch Upload API", "status": "running"}
 
 @app.get("/health")
 async def health_check():
@@ -227,9 +221,7 @@ async def health_check():
         return {
             "elasticsearch": "connected",
             "cluster_name": info.get("cluster_name"),
-            "version": info.get("version", {}).get("number"),
-            "es_url": ES_URL,
-            "default_index": DEFAULT_INDEX
+            "version": info.get("version", {}).get("number")
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Elasticsearch 연결 실패: {str(e)}")
@@ -244,5 +236,125 @@ async def get_indices():
             if not index_name.startswith(".")
         ]
         return {"total": len(index_list), "indices": index_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/fields/{index_name}")
+async def get_fields(index_name: str):
+    try:
+        if not es.indices.exists(index=index_name):
+            raise HTTPException(status_code=404, detail=f"인덱스 '{index_name}'를 찾을 수 없습니다")
+
+        mapping = es.indices.get_mapping(index=index_name)
+        props = mapping[index_name]["mappings"].get("properties", {})
+        fields = [{"name": k, "type": v.get("type", "object")} for k, v in props.items()]
+        return {"index_name": index_name, "total_fields": len(fields), "fields": fields}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/data/{index_name}")
+async def get_data(index_name: str, size: int = 100, from_: int = 0):
+    try:
+        if not es.indices.exists(index=index_name):
+            raise HTTPException(status_code=404, detail=f"인덱스 '{index_name}'를 찾을 수 없습니다")
+
+        response = es.search(
+            index=index_name,
+            body={"query": {"match_all": {}}, "size": size, "from": from_}
+        )
+        hits = response["hits"]["hits"]
+        documents = [h["_source"] for h in hits]
+        return {
+            "index_name": index_name,
+            "total": response["hits"]["total"]["value"],
+            "size": len(documents),
+            "from": from_,
+            "documents": documents
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/search/{index_name}")
+async def search_data(index_name: str, query: str, field: str = None, size: int = 100, min_score: float = None):
+    try:
+        if not es.indices.exists(index=index_name):
+            raise HTTPException(status_code=404, detail=f"인덱스 '{index_name}'를 찾을 수 없습니다")
+
+        if field:
+            search_query = {"query": {"match": {field: query}}, "size": size}
+        else:
+            search_query = {"query": {"multi_match": {"query": query, "type": "best_fields"}}, "size": size}
+
+        if min_score is not None:
+            search_query["min_score"] = min_score
+
+        response = es.search(index=index_name, body=search_query)
+        hits = response["hits"]["hits"]
+        documents = [hit["_source"] for hit in hits]
+        scores = [hit["_score"] for hit in hits]
+
+        return {
+            "index_name": index_name,
+            "query": query,
+            "field": field,
+            "min_score": min_score,
+            "total": response["hits"]["total"]["value"],
+            "size": len(documents),
+            "documents": documents,
+            "scores": scores
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/search-all-indices")
+async def search_all_indices(email: str, size: int = 100):
+    try:
+        all_indices = es.indices.get_alias(index="*")
+        index_names = [n for n in all_indices.keys() if not n.startswith(".")]
+
+        if not index_names:
+            return {"email": email, "total_indices_searched": 0, "results": []}
+
+        search_query = {
+            "query": {"multi_match": {"query": email, "type": "phrase", "fields": ["*"]}},
+            "size": size
+        }
+
+        results = []
+        total_found = 0
+
+        for idx in index_names:
+            try:
+                resp = es.search(index=idx, body=search_query)
+                hits = resp["hits"]["hits"]
+                if hits:
+                    docs = [{**h["_source"], "_score": h["_score"]} for h in hits]
+                    results.append({
+                        "index_name": idx,
+                        "total_hits": resp["hits"]["total"]["value"],
+                        "returned_hits": len(docs),
+                        "documents": docs
+                    })
+                    total_found += resp["hits"]["total"]["value"]
+            except Exception:
+                continue
+
+        return {
+            "email": email,
+            "total_indices_searched": len(index_names),
+            "total_documents_found": total_found,
+            "indices_with_results": len(results),
+            "results": results
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
