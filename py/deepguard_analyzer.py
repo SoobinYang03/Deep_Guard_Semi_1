@@ -4,13 +4,11 @@
 """
 DeepGuard Analyzer (file-based)
 - main.py에서 import해서 업로드된 파일(텍스트/CSV/TSV/JSON/NDJSON)을 분석
-- ✅ extract_indicators / classify_threat / score_severity "필수 3함수" 포함
+- extract_indicators / classify_threat / score_severity "필수 3함수" 포함
 - score_page 기반으로 (leak_type, severity, score, confidence) 산출
-- ✅ threat_type(=leak_type)별 저장 기준 맵 적용
-- ✅ 마스킹 on/off 토글 지원 (DG_MASK=1/0)
-- ✅ 디버그 로그 토글 (DG_DEBUG=1)
-- 출력 포맷: format_database() 기반 + 부가 필드(severity/score/counts/signals 등) 추가
-- 여러건 저장: 대표 1건 + examples N건
+- threat_type(=leak_type)별 저장 기준 맵 적용
+- 마스킹 on/off 토글 지원
+- 저장 조건 미달이어도 analyze_text_with_meta()가 reason/verdict 반환
 """
 
 import os
@@ -24,27 +22,23 @@ from typing import Any, Dict, List, Optional
 # =========================
 # Env toggles / defaults
 # =========================
-DG_MASK_DEFAULT = os.getenv("DG_MASK", "1").strip()  # 1=mask on, 0=off
-DG_DEBUG = os.getenv("DG_DEBUG", "0").strip()        # 1=debug on
+DG_MASK_DEFAULT = os.getenv("DG_MASK", "1").strip()            # 1=mask on, 0=off
+DG_DEBUG = os.getenv("DG_DEBUG", "0").strip()                 # 1=debug on
+DG_SAVE_MAP = os.getenv("DG_SAVE_MAP", "").strip()            # "email_dump=high,token_leak=medium"
+DG_SAVE_MIN_SEVERITY = os.getenv("DG_SAVE_MIN_SEVERITY", "").strip().lower()  # global override
 
-# Optional overrides
-DG_SAVE_MAP = os.getenv("DG_SAVE_MAP", "").strip()   # e.g. "email_dump=high,credential_leak=medium"
-DG_SAVE_MIN_SEVERITY = os.getenv("DG_SAVE_MIN_SEVERITY", "").strip().lower()  # global override: low/medium/high/critical
-
-# =========================
 # severity ordering
-# =========================
 _SEV_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+def _dbg(msg: str) -> None:
+    if DG_DEBUG == "1":
+        print(f"[DG_ANALYZER][DEBUG] {msg}", flush=True)
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def _dbg(msg: str) -> None:
-    if DG_DEBUG == "1":
-        print(f"[DG_ANALYZER][DEBUG] {msg}")
 
 # =========================
 # Regex indicators (필요 최소)
@@ -78,23 +72,20 @@ LEAK_HINT_WORDS = [
     "password list", "email:pass", "user:pass", "stealer log", "infostealer",
     "config leak", "api key", "private key"
 ]
-
 FORUM_HINT_WORDS = [
     "forum", "thread", "board", "posts", "reply", "replies", "members",
     "registration", "register", "profile", "subforum"
 ]
-
 NEWS_HINT_WORDS = [
     "newsletter", "press", "blog", "announcement", "news", "article",
     "copyright", "terms of service", "privacy policy"
 ]
-
 LOGIN_PATTERNS = [
     "login", "log-in", "sign in", "signin", "/login", "/signin", "account/login"
 ]
 
 def looks_like_login(text: str) -> bool:
-    lower = text[:900].lower()
+    lower = text[:800].lower()
     return any(p in lower for p in LOGIN_PATTERNS)
 
 def _unique(items: List[str]) -> List[str]:
@@ -107,7 +98,7 @@ def _unique(items: List[str]) -> List[str]:
     return out
 
 # ==========================================================
-# ✅ (필수 1) extract_indicators(text)
+# ✅ 필수 함수 1: extract_indicators(text)
 # ==========================================================
 def extract_indicators(text: str) -> Dict[str, Any]:
     lines = text.splitlines()
@@ -170,7 +161,7 @@ def extract_indicators(text: str) -> Dict[str, Any]:
     }
 
 # ==========================================================
-# ✅ (필수 2) classify_threat(indicators)
+# ✅ 필수 함수 2: classify_threat(indicators)
 # ==========================================================
 def classify_threat(ind: Dict[str, Any]) -> str:
     if ind.get("credentials"):
@@ -188,7 +179,7 @@ def classify_threat(ind: Dict[str, Any]) -> str:
     return "none"
 
 # ==========================================================
-# ✅ (필수 3) score_severity(threat_type, indicators)
+# ✅ 필수 함수 3: score_severity(threat_type, indicators)
 # ==========================================================
 def score_severity(threat_type: str, ind: Dict[str, Any]) -> str:
     creds = len(ind.get("credentials", []))
@@ -239,7 +230,7 @@ class Verdict:
     signals: Dict[str, Any]
 
 def _score_page(text: str, ind: Dict[str, Any]) -> Verdict:
-    t = text[:3500].lower()
+    t = text[:3000].lower()
 
     has_leak_words = any(w in t for w in LEAK_HINT_WORDS)
     forumish = any(w in t for w in FORUM_HINT_WORDS)
@@ -309,16 +300,13 @@ def _score_page(text: str, ind: Dict[str, Any]) -> Verdict:
     return Verdict(leak_type=leak_type, severity=severity, score=score, confidence=conf, signals=signals)
 
 # =========================
-# 저장 기준: threat_type별 맵
+# 저장 기준: threat_type별 맵 + override
 # =========================
 DEFAULT_SAVE_MIN_BY_TYPE = {
-    # 민감 타입은 medium부터 저장 권장
     "token_leak": "medium",
     "config_leak": "medium",
     "infra_leak": "medium",
     "credential_leak": "medium",
-
-    # 노이즈 큰 타입은 high부터 권장
     "email_dump": "high",
     "financial_leak": "high",
 }
@@ -353,23 +341,18 @@ def should_save_by_type(verdict: Verdict) -> bool:
 # =========================
 # Masking (on/off)
 # =========================
-def _mask_email_line(line: str) -> str:
-    # a***@domain.com 형태(라인 내 첫 이메일만 처리)
-    m = EMAIL_RE.search(line)
-    if not m:
-        return line
-    e = m.group(0)
-    local, _, domain = e.partition("@")
-    if len(local) <= 1:
-        masked = "*" + "@" + domain
-    else:
-        masked = local[0] + "***@" + domain
-    return line.replace(e, masked)
+def _mask_email_in_line(line: str) -> str:
+    def repl(m):
+        e = m.group(0)
+        local, _, domain = e.partition("@")
+        if len(local) <= 1:
+            return "*@" + domain
+        return local[0] + "***@" + domain
+    return EMAIL_RE.sub(repl, line)
 
 def _mask_secret_like(line: str) -> str:
-    # 토큰/키/패스워드류를 sha256:xxxx 형태로 축약 치환
-    def repl(_m):
-        raw = _m.group(0)
+    def repl(m):
+        raw = m.group(0)
         return "sha256:" + sha256_hex(raw)[:16]
     line = AWS_KEY_RE.sub(repl, line)
     line = GITHUB_PAT_RE.sub(repl, line)
@@ -380,12 +363,12 @@ def _mask_secret_like(line: str) -> str:
 def apply_masking(text: str, enabled: bool) -> str:
     if not enabled:
         return text
-    out = []
+    out_lines = []
     for line in text.splitlines():
-        x = _mask_email_line(line)
+        x = _mask_email_in_line(line)
         x = _mask_secret_like(x)
-        out.append(x)
-    return "\n".join(out)
+        out_lines.append(x)
+    return "\n".join(out_lines)
 
 # =========================
 # Output formatter (요구 포맷 + 추가필드)
@@ -395,13 +378,13 @@ def format_database(keyword_type: str, raw_text: str, original_link: str, leak_d
         "id": str(uuid.uuid4()),
         "keyword_type": keyword_type,
         "source_id": "File",
-        "original_link": original_link,  # analyzer니까 파일명
+        "original_link": original_link,  # 파일 분석이므로 파일명을 넣음
         "raw_text": raw_text,
         "leak_date": str(leak_date),
     }
 
 # =========================
-# Public API: analyze_text
+# Public API: analyze_text (호환용)
 # =========================
 def analyze_text(
     text: str,
@@ -410,10 +393,33 @@ def analyze_text(
     mask: Optional[bool] = None,
     extra_meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    meta = analyze_text_with_meta(
+        text=text,
+        filename=filename,
+        leak_date=leak_date,
+        mask=mask,
+        extra_meta=extra_meta,
+    )
+    return meta["saved_rows"]
+
+# =========================
+# ✅ Public API: analyze_text_with_meta
+# =========================
+def analyze_text_with_meta(
+    text: str,
+    filename: str,
+    leak_date: Optional[str] = None,
+    mask: Optional[bool] = None,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    main.py에서 호출:
-      rows = analyze_text(text, filename=file.filename, leak_date=..., mask=..., extra_meta=...)
-    반환: ES에 그대로 넣을 수 있는 dict 리스트(여러 건)
+    저장 조건 미달이어도 meta를 반환:
+    {
+      "saved_rows": [...],          # ES에 넣을 docs (없으면 [])
+      "verdict": {...},             # leak_type/severity/score/confidence/signals/counts/save_min
+      "reason": "..." or None,      # 저장 안된 이유
+      "mask_applied": bool
+    }
     """
     if leak_date is None:
         leak_date = utc_now_iso()
@@ -429,9 +435,6 @@ def analyze_text(
     min_sev = get_min_severity_for_type(verdict.leak_type)
 
     counts = verdict.signals.get("counts", {})
-    _dbg(f"file={filename} leak_type={verdict.leak_type} severity={verdict.severity} score={verdict.score} conf={verdict.confidence}")
-    _dbg(f"counts={counts}")
-    _dbg(f"save_min_for_type={min_sev} (global_override={DG_SAVE_MIN_SEVERITY or 'none'})")
 
     reason = None
     if verdict.leak_type == "none":
@@ -439,11 +442,24 @@ def analyze_text(
     elif _SEV_RANK.get(verdict.severity, 0) < _SEV_RANK.get(min_sev, 2):
         reason = f"severity_too_low (got={verdict.severity}, need>={min_sev})"
 
-    if reason:
-        _dbg(f"SKIP reason={reason}")
-        return []
+    verdict_payload = {
+        "leak_type": verdict.leak_type,
+        "severity": verdict.severity,
+        "score": verdict.score,
+        "confidence": verdict.confidence,
+        "signals": {k: v for k, v in verdict.signals.items() if k != "counts"},
+        "counts": counts,
+        "save_min_severity": min_sev,
+    }
 
-    _dbg("SAVE decision=pass")
+    if reason:
+        _dbg(f"SKIP file={filename} reason={reason} verdict={verdict_payload}")
+        return {
+            "saved_rows": [],
+            "verdict": verdict_payload,
+            "reason": reason,
+            "mask_applied": bool(mask),
+        }
 
     masked_text = apply_masking(text, enabled=mask)
     base_raw = (masked_text[:4000]).strip() or "(empty)"
@@ -471,7 +487,7 @@ def analyze_text(
     })
     rows.append(doc)
 
-    # example 여러 건
+    # examples 여러 건 저장
     examples = ind.get("examples", []) or []
     for ex in examples[:10]:
         ex_text = apply_masking(ex, enabled=mask)
@@ -493,5 +509,10 @@ def analyze_text(
         })
         rows.append(ex_doc)
 
-    _dbg(f"SAVED docs={len(rows)}")
-    return rows
+    _dbg(f"SAVE file={filename} docs={len(rows)} verdict={verdict_payload}")
+    return {
+        "saved_rows": rows,
+        "verdict": verdict_payload,
+        "reason": None,
+        "mask_applied": bool(mask),
+    }
