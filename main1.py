@@ -3,12 +3,10 @@ from fastapi.responses import JSONResponse
 import pandas as pd
 import os
 import tempfile
-from datetime import datetime, timezone, date
 from elasticsearch import Elasticsearch, helpers
 
-# ✅ DeepGuard Analyzer import
-# deepguard_analyzer.py 에 analyze_file_content 가 있어야 함
-from deepguard_analyzer import analyze_file_content
+# ✅ 추가: analyzer import
+import deepguard_analyzer
 
 app = FastAPI()
 
@@ -17,10 +15,8 @@ es = Elasticsearch(
     verify_certs=False
 )
 
-# ----------------------------
-# 기존: 파일 → DataFrame 로딩
-# ----------------------------
 def load_file_to_dataframe(file_path, content_type):
+    """파일을 DataFrame으로 변환"""
     _, ext = os.path.splitext(file_path)
     ext = ext.lower()
 
@@ -37,122 +33,51 @@ def load_file_to_dataframe(file_path, content_type):
 
     return df.fillna('')
 
-def doc_generator_from_df(df, index_name):
+def doc_generator(df, index_name):
+    """Bulk API를 위한 Generator"""
     for _, row in df.iterrows():
-        yield {"_index": index_name, "_source": row.to_dict()}
+        yield {
+            "_index": index_name,
+            "_source": row.to_dict()
+        }
 
-# ----------------------------
-# ✅ Analyzer 결과 → Bulk 제너레이터
-# ----------------------------
-def doc_generator_from_records(records, index_name):
+def docs_from_list(records, index_name: str):
+    """list[dict] -> bulk docs"""
     for r in records:
-        yield {"_index": index_name, "_source": r}
-
-def guess_leak_date() -> str:
-    # 기본값: 오늘(UTC). 필요하면 파일명/내용에서 파싱 로직 추가 가능
-    return str(date.today())
+        yield {
+            "_index": index_name,
+            "_source": r
+        }
 
 @app.post("/upload")
 async def upload_to_elasticsearch(
     file: UploadFile = File(...),
-    index_name: str = None,
-
-    # ✅ analyze=true면 deepguard_analyzer 실행
-    analyze: bool = Query(default=False),
-
-    # ✅ mask=false면 마스킹/해싱 OFF (원문 저장)
-    mask: bool = Query(default=True),
-
-    # ✅ keyword_type을 라벨링(없으면 analyzer가 추론한 값 사용)
-    keyword_type: str = Query(default="leak_indicator"),
-
-    # ✅ leak_date 수동 지정 (없으면 기본 today)
-    leak_date: str = Query(default=None),
+    index_name: str = None
 ):
     """
-    파일을 Elasticsearch에 업로드
-
-    - analyze=false: 기존처럼 CSV/TSV/JSON/NDJSON → DataFrame → bulk 적재
-    - analyze=true : deepguard_analyzer로 분석 → 결과 레코드(list[dict]) → bulk 적재
-
-    쿼리 예시:
-      /upload?analyze=true&mask=true&index_name=deepguard_hits
-      /upload?analyze=true&mask=false
+    (기존 그대로) 파일을 Elasticsearch에 업로드
+    - file: CSV, TSV, JSON, NDJSON 파일
+    - index_name: Elasticsearch 인덱스 이름 (기본값: 파일명)
     """
-    tmp_file_path = None
     try:
         if index_name is None:
             index_name = os.path.splitext(file.filename)[0]
 
-        # 임시 파일 생성
-        suffix = os.path.splitext(file.filename)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp_file:
             content = await file.read()
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
 
-        # ----------------------------
-        # ✅ Analyzer 모드
-        # ----------------------------
-        if analyze:
-            # 텍스트 읽기(분석용). 바이너리면 decode 실패할 수 있으니 errors=ignore
-            with open(tmp_file_path, "rb") as f:
-                raw = f.read()
-            text = raw.decode("utf-8", errors="ignore")
-
-            leak_date_final = leak_date or guess_leak_date()
-
-            # ✅ Analyzer 호출 (여기서 여러 건으로 쪼개짐)
-            # analyze_file_content는 list[dict] 반환하도록 만들어둔 버전 기준
-            records = analyze_file_content(
-                file_text=text,
-                filename=file.filename,     # original_link에 파일명 넣기 위함
-                leak_date=leak_date_final,
-                keyword_type=keyword_type,
-                mask=mask,
-            )
-
-            if not records:
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "message": "분석 결과 저장할 레코드가 없습니다(조건 미달).",
-                        "index_name": index_name,
-                        "total_records": 0,
-                        "mask": mask
-                    }
-                )
-
-            success, failed = helpers.bulk(
-                es,
-                doc_generator_from_records(records, index_name),
-                raise_on_error=False
-            )
-
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "message": "분석+업로드 성공",
-                    "mode": "analyzer",
-                    "index_name": index_name,
-                    "success": success,
-                    "failed": failed,
-                    "total_records": len(records),
-                    "mask": mask,
-                }
-            )
-
-        # ----------------------------
-        # 기존 업로드 모드 (DataFrame)
-        # ----------------------------
         df = load_file_to_dataframe(tmp_file_path, file.content_type)
-        success, failed = helpers.bulk(es, doc_generator_from_df(df, index_name), raise_on_error=False)
+
+        success, failed = helpers.bulk(es, doc_generator(df, index_name))
+
+        os.unlink(tmp_file_path)
 
         return JSONResponse(
             status_code=200,
             content={
                 "message": "업로드 성공",
-                "mode": "raw_upload",
                 "index_name": index_name,
                 "success": success,
                 "failed": failed,
@@ -161,10 +86,61 @@ async def upload_to_elasticsearch(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if tmp_file_path and os.path.exists(tmp_file_path):
+        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ 추가 엔드포인트: deepguard analyzer 연동
+@app.post("/deepguard/analyze-upload")
+async def analyze_upload_and_index(
+    file: UploadFile = File(...),
+    index_name: str = Query(default="deepguard_hits", description="Elasticsearch index name"),
+    mask: bool = Query(default=True, description="Mask/hash sensitive patterns in raw_text"),
+):
+    """
+    업로드된 파일을 deepguard_analyzer로 분석 후,
+    표준 포맷(list[dict]) 결과를 ES에 적재.
+    """
+    try:
+        content = await file.read()
+
+        # analyzer 실행 (filename이 original_link로 들어감)
+        records = deepguard_analyzer.analyze_bytes(
+            file_bytes=content,
+            filename=file.filename,
+            mask=mask
+        )
+
+        if not records:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "분석 결과 없음 (저장 조건 미달)",
+                    "index_name": index_name,
+                    "saved": 0,
+                    "mask": mask
+                }
+            )
+
+        success, failed = helpers.bulk(es, docs_from_list(records, index_name))
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "분석 및 적재 성공",
+                "index_name": index_name,
+                "saved": success,
+                "failed": failed,
+                "records_returned": len(records),
+                "mask": mask,
+                "keyword_types": sorted(list({r.get("keyword_type") for r in records}))
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/")
 async def root():
@@ -187,7 +163,10 @@ async def get_indices():
     try:
         indices = es.indices.get_alias(index="*")
         index_list = [
-            {"name": index_name, "aliases": list(info.get("aliases", {}).keys())}
+            {
+                "name": index_name,
+                "aliases": list(info.get("aliases", {}).keys())
+            }
             for index_name, info in indices.items()
             if not index_name.startswith(".")
         ]
@@ -202,10 +181,11 @@ async def get_fields(index_name: str):
             raise HTTPException(status_code=404, detail=f"인덱스 '{index_name}'를 찾을 수 없습니다")
 
         mapping = es.indices.get_mapping(index=index_name)
+        fields = []
         properties = mapping[index_name]['mappings'].get('properties', {})
 
-        fields = [{"name": field_name, "type": field_info.get('type', 'object')}
-                  for field_name, field_info in properties.items()]
+        for field_name, field_info in properties.items():
+            fields.append({"name": field_name, "type": field_info.get('type', 'object')})
 
         return {"index_name": index_name, "total_fields": len(fields), "fields": fields}
     except HTTPException:
@@ -223,6 +203,7 @@ async def get_data(index_name: str, size: int = 100, from_: int = 0):
             index=index_name,
             body={"query": {"match_all": {}}, "size": size, "from": from_}
         )
+
         hits = response['hits']['hits']
         documents = [hit['_source'] for hit in hits]
 
@@ -232,40 +213,6 @@ async def get_data(index_name: str, size: int = 100, from_: int = 0):
             "size": len(documents),
             "from": from_,
             "documents": documents
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/search/{index_name}")
-async def search_data(index_name: str, query: str, field: str = None, size: int = 100, min_score: float = None):
-    try:
-        if not es.indices.exists(index=index_name):
-            raise HTTPException(status_code=404, detail=f"인덱스 '{index_name}'를 찾을 수 없습니다")
-
-        if field:
-            search_query = {"query": {"match": {field: query}}, "size": size}
-        else:
-            search_query = {"query": {"multi_match": {"query": query, "type": "best_fields", "fields": ["*"]}}, "size": size}
-
-        if min_score is not None:
-            search_query["min_score"] = min_score
-
-        response = es.search(index=index_name, body=search_query)
-        hits = response['hits']['hits']
-        documents = [hit['_source'] for hit in hits]
-        scores = [hit['_score'] for hit in hits]
-
-        return {
-            "index_name": index_name,
-            "query": query,
-            "field": field,
-            "min_score": min_score,
-            "total": response['hits']['total']['value'],
-            "size": len(documents),
-            "documents": documents,
-            "scores": scores
         }
     except HTTPException:
         raise
