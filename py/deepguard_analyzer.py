@@ -1,327 +1,477 @@
-# deepguard_analyzer.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-DeepGuard Analyzer (import-friendly)
-
-- Designed to be imported from FastAPI main.py
-- Analyze uploaded file content (text/csv/tsv/json/ndjson...)
-- Return results in unified crawler DB format (multiple records)
-- Masking/Hashing is optional (mask=True/False)
-
-Output format:
-{
-  "id": "<uuid4>",
-  "keyword_type": "<threat category>",
-  "source_id": "File",
-  "original_link": "<filename>",
-  "raw_text": "<evidence text (optionally masked)>",
-  "leak_date": "<iso datetime>"
-}
+DeepGuard Analyzer (file-based)
+- main.py에서 import해서 업로드된 파일(텍스트/CSV/TSV/JSON/NDJSON)을 분석
+- extract_indicators / classify_threat / score_severity "필수 3함수" 포함
+- score_page 기반으로 (leak_type, severity, score, confidence) 산출
+- threat_type(=leak_type)별 저장 기준 맵 적용
+- 마스킹 on/off 토글 지원
+- 출력 포맷: format_database() 기반 + 부가 필드(severity/score/counts 등) 추가
 """
 
-from __future__ import annotations
-
-import hashlib
-import json
+import os
 import re
 import uuid
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+# =========================
+# Env toggles / defaults
+# =========================
+DG_MASK_DEFAULT = os.getenv("DG_MASK", "1").strip()  # 1=mask on, 0=off
+DG_SAVE_MAP = os.getenv("DG_SAVE_MAP", "").strip()  # optional override string
+DG_SAVE_MIN_SEVERITY = os.getenv("DG_SAVE_MIN_SEVERITY", "").strip().lower()  # optional global override
 
-# -------------------------
-# Regex indicators (safe subset)
-# -------------------------
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}")
-IPV4_RE = re.compile(
-    r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
-)
+# severity ordering
+_SEV_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-# credentials patterns
-EMAIL_PASS_RE = re.compile(
-    r"(?P<email>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24})"
-    r"\s*[:;]\s*(?P<pw>[^\s:;]{3,})"
-)
-USER_PASS_RE = re.compile(
-    r"(?i)(user(name)?|login)\s*[:=]\s*(?P<user>[^\s,;]+).{0,40}?"
-    r"(pass(word)?|pwd)\s*[:=]\s*(?P<pw>[^\s,;]+)"
-)
-
-# token-ish patterns (대표만)
-AWS_KEY_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
-GITHUB_PAT_RE = re.compile(r"\bghp_[0-9A-Za-z]{36}\b")
-STRIPE_SK_RE = re.compile(r"\bsk_live_[0-9A-Za-z]{24,}\b")
-JWT_RE = re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{5,}\b")
-SLACK_TOKEN_RE = re.compile(r"\bxox[abp]-[0-9A-Za-z-]{10,}\b")
-TELEGRAM_BOT_RE = re.compile(r"\b[0-9]{7,10}:[A-Za-z0-9_-]{20,}\b")
-
-# infra/config patterns
-SSH_PUBKEY_RE = re.compile(r"\bssh-(rsa|ed25519|dss)\s+[A-Za-z0-9+/=]{20,}\b")
-DB_URI_RE = re.compile(
-    r"(?i)\b(?:postgres|mysql|mssql|oracle)://"
-    r"(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@(?P<host>[^:/\s]+)"
-)
-CONFIG_LINE_RE = re.compile(
-    r"(?i)\b(pass(word)?|pwd|secret|api_key|token)\s*=\s*['\"]?([^'\"\s]{4,})['\"]?"
-)
-
-# light PII patterns
-PHONE_KR_RE = re.compile(r"\b01[016789]-?\d{3,4}-?\d{4}\b")
-SSN_RE = re.compile(r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b")  # US SSN (예시)
-
-
-# -------------------------
-# Utilities
-# -------------------------
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
-def unique_list(items: List[str], limit: Optional[int] = None) -> List[str]:
+# =========================
+# Regex indicators (필요 최소)
+# =========================
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}\b")
+EMAIL_PASS_RE = re.compile(
+    r"(?P<email>[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24})\s*[:;]\s*(?P<pw>[^\s:;]{3,})"
+)
+USER_PASS_RE = re.compile(
+    r"(?i)(user(name)?|login)\s*[:=]\s*(?P<user>[^\s,;]+).{0,40}?(pass(word)?|pwd)\s*[:=]\s*(?P<pw>[^\s,;]+)"
+)
+HASH_RE = re.compile(r"\b[0-9a-f]{32,64}\b", re.IGNORECASE)
+CARD_RE = re.compile(
+    r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b"
+)
+AWS_KEY_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+GITHUB_PAT_RE = re.compile(r"\bghp_[0-9A-Za-z]{36}\b")
+STRIPE_SK_RE = re.compile(r"\bsk_live_[0-9A-Za-z]{24,}\b")
+JWT_RE = re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{5,}\b")
+SSH_PUBKEY_RE = re.compile(r"\bssh-(rsa|ed25519|dss)\s+[A-Za-z0-9+/=]{20,}\b")
+DB_URI_RE = re.compile(
+    r"(?i)\b(?:postgres|mysql|mssql|oracle)://(?P<user>[^:@\s]+):(?P<pw>[^:@\s]+)@(?P<host>[^:/\s]+)"
+)
+CONFIG_LINE_RE = re.compile(
+    r"(?i)\b(pass(word)?|pwd|secret|api_key|token)\s*=\s*['\"]?([^'\"\s]{4,})['\"]?"
+)
+
+LEAK_HINT_WORDS = [
+    "database dump", "db dump", "full dump", "combo list", "credentials",
+    "stolen data", "leaked data", "exfiltrated", "data leak", "ransomware",
+    "password list", "email:pass", "user:pass", "stealer log", "infostealer",
+    "config leak", "api key", "private key"
+]
+
+FORUM_HINT_WORDS = [
+    "forum", "thread", "board", "posts", "reply", "replies", "members",
+    "registration", "register", "profile", "subforum"
+]
+
+NEWS_HINT_WORDS = [
+    "newsletter", "press", "blog", "announcement", "news", "article",
+    "copyright", "terms of service", "privacy policy"
+]
+
+LOGIN_PATTERNS = [
+    "login", "log-in", "sign in", "signin", "/login", "/signin", "account/login"
+]
+
+def looks_like_login(text: str) -> bool:
+    lower = text[:800].lower()
+    return any(p in lower for p in LOGIN_PATTERNS)
+
+def _unique(items: List[str]) -> List[str]:
     seen = set()
     out = []
     for x in items:
         if x not in seen:
             seen.add(x)
             out.append(x)
-        if limit is not None and len(out) >= limit:
-            break
     return out
 
-def format_database(keyword_type: str, raw_text: str, filename: str, leak_date: str) -> Dict[str, Any]:
-    return {
-        "id": str(uuid.uuid4()),
-        "keyword_type": keyword_type,
-        "source_id": "File",
-        "original_link": filename,   # 분석이므로 URL 대신 파일명
-        "raw_text": raw_text,
-        "leak_date": str(leak_date),
-    }
-
-
-# -------------------------
-# Extraction + classification
-# -------------------------
-@dataclass
-class Indicators:
-    credentials: int
-    tokens: int
-    financial: int
-    config: int
-    infra: int
-    email_count: int
-    pii: int
-    sample_lines: List[str]
-    matched_emails: List[str]
-    matched_ips: List[str]
-    matched_tokens: List[str]
-
-
-def _extract_indicators(text: str) -> Indicators:
+# ==========================================================
+# ✅ (1) 필수 함수: extract_indicators(text)
+# ==========================================================
+def extract_indicators(text: str) -> Dict[str, Any]:
     lines = text.splitlines()
 
-    creds = 0
-    tokens = 0
-    financial = 0  # 카드패턴은 여기선 생략(원하면 추가 가능)
-    config = 0
-    infra = 0
-    pii = 0
-
-    sample_lines: List[str] = []
-    emails: List[str] = []
-    ips: List[str] = []
-    token_hits: List[str] = []
+    creds: List[Dict[str, str]] = []
+    emails, hashes, cards, tokens = [], [], [], []
+    ssh_keys, db_uris, config_lines = [], [], []
+    hit_examples = []
 
     for line in lines:
         s = line.strip()
         if not s:
             continue
 
-        # emails / ips (counts + list)
         for m in EMAIL_RE.findall(s):
             emails.append(m)
-        for m in IPV4_RE.findall(s):
-            ips.append(m)
 
-        # credentials
-        if EMAIL_PASS_RE.search(s) or USER_PASS_RE.search(s):
-            creds += 1
-            if len(sample_lines) < 30:
-                sample_lines.append(s)
+        for m in EMAIL_PASS_RE.finditer(s):
+            creds.append({"email": m.group("email"), "password": m.group("pw"), "pattern": "email:password"})
+            hit_examples.append(s)
 
-        # tokens
-        found_tok = False
-        for rx in (AWS_KEY_RE, GITHUB_PAT_RE, STRIPE_SK_RE, JWT_RE, SLACK_TOKEN_RE, TELEGRAM_BOT_RE):
-            for m in rx.findall(s):
-                found_tok = True
-                token_hits.append(m if isinstance(m, str) else str(m))
-        if found_tok:
-            tokens += 1
-            if len(sample_lines) < 30:
-                sample_lines.append(s)
+        for m in USER_PASS_RE.finditer(s):
+            creds.append({"username": m.group("user"), "password": m.group("pw"), "pattern": "user/pass"})
+            hit_examples.append(s)
 
-        # infra/config
+        for h in HASH_RE.findall(s):
+            hashes.append(h)
+
+        for c in CARD_RE.findall(s):
+            cards.append(c)
+
+        for t in AWS_KEY_RE.findall(s):
+            tokens.append(t)
+        for t in GITHUB_PAT_RE.findall(s):
+            tokens.append(t)
+        for t in STRIPE_SK_RE.findall(s):
+            tokens.append(t)
+        for t in JWT_RE.findall(s):
+            tokens.append(t)
+
         if SSH_PUBKEY_RE.search(s):
-            infra += 1
-            if len(sample_lines) < 30:
-                sample_lines.append(s)
+            ssh_keys.append(s)
 
-        if DB_URI_RE.search(s) or CONFIG_LINE_RE.search(s):
-            config += 1
-            if len(sample_lines) < 30:
-                sample_lines.append(s)
+        for m in DB_URI_RE.finditer(s):
+            db_uris.append({"user": m.group("user"), "password": m.group("pw"), "host": m.group("host")})
 
-        # PII-ish
-        if PHONE_KR_RE.search(s) or SSN_RE.search(s):
-            pii += 1
-            if len(sample_lines) < 30:
-                sample_lines.append(s)
+        if CONFIG_LINE_RE.search(s):
+            config_lines.append(s)
 
-    email_unique = unique_list(emails)
-    ip_unique = unique_list(ips)
-    token_unique = unique_list(token_hits)
+    return {
+        "credentials": creds,
+        "emails": _unique(emails),
+        "hashes": _unique(hashes),
+        "cards": _unique(cards),
+        "tokens": _unique(tokens),
+        "ssh_keys": _unique(ssh_keys),
+        "db_uri": db_uris,
+        "config": _unique(config_lines),
+        "examples": _unique(hit_examples)[:30],
+    }
 
-    return Indicators(
-        credentials=creds,
-        tokens=tokens,
-        financial=financial,
-        config=config,
-        infra=infra,
-        email_count=len(email_unique),
-        pii=pii,
-        sample_lines=unique_list(sample_lines, limit=30),
-        matched_emails=email_unique[:200],
-        matched_ips=ip_unique[:200],
-        matched_tokens=token_unique[:200],
-    )
+# ==========================================================
+# ✅ (1) 필수 함수: classify_threat(indicators)
+# ==========================================================
+def classify_threat(ind: Dict[str, Any]) -> str:
+    if ind.get("credentials"):
+        return "credential_leak"
+    if ind.get("cards"):
+        return "financial_leak"
+    if ind.get("tokens"):
+        return "token_leak"
+    if ind.get("db_uri") or ind.get("config"):
+        return "config_leak"
+    if ind.get("ssh_keys"):
+        return "infra_leak"
+    if len(ind.get("emails", [])) >= 50:
+        return "email_dump"
+    return "none"
 
+# ==========================================================
+# ✅ (1) 필수 함수: score_severity(threat_type, indicators)
+# ==========================================================
+def score_severity(threat_type: str, ind: Dict[str, Any]) -> str:
+    creds = len(ind.get("credentials", []))
+    emails = len(ind.get("emails", []))
+    cards = len(ind.get("cards", []))
+    tokens = len(ind.get("tokens", []))
 
-def _decide_keyword_types(ind: Indicators) -> List[str]:
+    if threat_type == "none":
+        return "low"
+
+    if threat_type == "credential_leak":
+        if creds >= 100 or emails >= 500:
+            return "critical"
+        if creds >= 20 or emails >= 100:
+            return "high"
+        return "medium"
+
+    if threat_type == "financial_leak":
+        return "critical" if cards >= 10 else "high"
+
+    if threat_type == "token_leak":
+        return "critical" if tokens >= 3 else "high"
+
+    if threat_type == "config_leak":
+        return "critical"
+
+    if threat_type == "infra_leak":
+        return "high"
+
+    if threat_type == "email_dump":
+        if emails >= 1000:
+            return "critical"
+        if emails >= 200:
+            return "high"
+        return "medium"
+
+    return "low"
+
+# =========================
+# score_page 기반 verdict
+# =========================
+@dataclass
+class Verdict:
+    leak_type: str
+    severity: str
+    score: int
+    confidence: str
+    signals: Dict[str, Any]
+
+def _score_page(text: str, ind: Dict[str, Any]) -> Verdict:
+    t = text[:3000].lower()
+
+    has_leak_words = any(w in t for w in LEAK_HINT_WORDS)
+    forumish = any(w in t for w in FORUM_HINT_WORDS)
+    newsish = any(w in t for w in NEWS_HINT_WORDS)
+    loginish = looks_like_login(text)
+
+    creds = len(ind.get("credentials", []))
+    cards = len(ind.get("cards", []))
+    tokens = len(ind.get("tokens", []))
+    emails = len(ind.get("emails", []))
+    config = len(ind.get("config", []))
+    dburi = len(ind.get("db_uri", []))
+    sshk = len(ind.get("ssh_keys", []))
+
+    score = 0
+    score += min(10, creds * 2)
+    score += min(10, cards * 2)
+    score += min(10, tokens * 3)
+    score += min(6, dburi * 3)
+    score += min(6, config * 2)
+    score += min(6, sshk * 2)
+
+    if emails >= 50:
+        score += 2
+    if emails >= 200:
+        score += 3
+    if has_leak_words:
+        score += 3
+
+    # FP reducers
+    if forumish and not (creds or cards or tokens or dburi or config or sshk):
+        score -= 5
+    if newsish and not (creds or cards or tokens or dburi or config or sshk):
+        score -= 4
+    if loginish:
+        score -= 8
+
+    leak_type = classify_threat(ind)
+    severity = score_severity(leak_type, ind)
+
+    if score >= 8:
+        conf = "high"
+    elif score >= 4:
+        conf = "medium"
+    else:
+        conf = "low"
+
+    signals = {
+        "has_leak_words": has_leak_words,
+        "is_forumish": forumish,
+        "is_newsish": newsish,
+        "is_loginish": loginish,
+        "counts": {
+            "credentials": creds,
+            "cards": cards,
+            "tokens": tokens,
+            "emails": emails,
+            "config": config,
+            "db_uri": dburi,
+            "ssh_keys": sshk,
+        }
+    }
+
+    if leak_type == "none":
+        severity = "low"
+
+    return Verdict(leak_type=leak_type, severity=severity, score=score, confidence=conf, signals=signals)
+
+# =========================
+# 저장 기준: threat_type별 맵
+# =========================
+DEFAULT_SAVE_MIN_BY_TYPE = {
+    # “민감” 타입은 medium도 저장 허용
+    "token_leak": "medium",
+    "config_leak": "medium",
+    "infra_leak": "medium",
+
+    # credential은 medium부터 저장(원하면 high로 올려도 됨)
+    "credential_leak": "medium",
+
+    # email_dump는 노이즈 많으니 high부터 추천
+    "email_dump": "high",
+
+    # 카드류는 high부터
+    "financial_leak": "high",
+}
+
+def _parse_save_map(env_s: str) -> Dict[str, str]:
     """
-    '여러건으로 쪼개서 저장' 요구 반영:
-    발견된 성격별로 keyword_type 여러 개를 반환할 수 있음.
+    예) "email_dump=high,token_leak=medium,credential_leak=high"
     """
-    types: List[str] = []
+    out: Dict[str, str] = {}
+    if not env_s:
+        return out
+    for part in env_s.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        v = v.strip().lower()
+        if v in _SEV_RANK:
+            out[k] = v
+    return out
 
-    if ind.credentials > 0:
-        types.append("credential_leak")
-    if ind.tokens > 0:
-        types.append("token_leak")
-    if ind.config > 0:
-        types.append("config_leak")
-    if ind.infra > 0:
-        types.append("infrastructure_leak")
-    if ind.pii > 0:
-        types.append("identity_leak")
-    if ind.email_count >= 50:
-        types.append("email_dump")
+def should_save_by_type(verdict: Verdict) -> bool:
+    if verdict.leak_type == "none":
+        return False
 
-    # 아무것도 없으면 빈 리스트
-    return types
+    # global override 있으면 그게 우선
+    if DG_SAVE_MIN_SEVERITY in _SEV_RANK:
+        return _SEV_RANK[verdict.severity] >= _SEV_RANK[DG_SAVE_MIN_SEVERITY]
 
+    # type map override (env) > default map
+    custom = _parse_save_map(DG_SAVE_MAP)
+    min_sev = custom.get(verdict.leak_type) or DEFAULT_SAVE_MIN_BY_TYPE.get(verdict.leak_type, "high")
+    return _SEV_RANK[verdict.severity] >= _SEV_RANK[min_sev]
 
-# -------------------------
-# Masking (optional)
-# -------------------------
-def _mask_text(text: str) -> str:
-    """
-    원문을 완전히 없애는 게 아니라,
-    이메일/IP/토큰 문자열을 sha256로 치환하는 방식(가벼운 마스킹).
-    """
-    # 이메일 마스킹
-    def repl_email(m: re.Match) -> str:
-        return f"email_sha256:{sha256_hex(m.group(0))}"
+# =========================
+# Masking (on/off)
+# =========================
+def _mask_email(s: str) -> str:
+    # a***@domain.com 형태
+    m = EMAIL_RE.search(s)
+    if not m:
+        return s
+    e = m.group(0)
+    local, _, domain = e.partition("@")
+    if len(local) <= 1:
+        masked = "*" + "@" + domain
+    else:
+        masked = local[0] + "***@" + domain
+    return s.replace(e, masked)
 
-    # IPv4 마스킹
-    def repl_ip(m: re.Match) -> str:
-        return f"ip_sha256:{sha256_hex(m.group(0))}"
+def _mask_secret_like(s: str) -> str:
+    # 토큰/키/패스워드류를 "sha256:..."로 치환(원문 제거)
+    def repl(_m):
+        raw = _m.group(0)
+        return "sha256:" + sha256_hex(raw)[:16]
+    s = AWS_KEY_RE.sub(repl, s)
+    s = GITHUB_PAT_RE.sub(repl, s)
+    s = STRIPE_SK_RE.sub(repl, s)
+    s = JWT_RE.sub(repl, s)
+    return s
 
-    text = EMAIL_RE.sub(repl_email, text)
-    text = IPV4_RE.sub(repl_ip, text)
+def apply_masking(text: str, enabled: bool) -> str:
+    if not enabled:
+        return text
 
-    # 토큰류 마스킹 (패턴이 길어서 line 단위보다 전체 치환)
-    for rx in (AWS_KEY_RE, GITHUB_PAT_RE, STRIPE_SK_RE, JWT_RE, SLACK_TOKEN_RE, TELEGRAM_BOT_RE):
-        text = rx.sub(lambda m: f"token_sha256:{sha256_hex(m.group(0))}", text)
+    # 이메일/토큰/키만 “표시 레벨”에서 마스킹
+    lines = []
+    for line in text.splitlines():
+        x = _mask_email(line)
+        x = _mask_secret_like(x)
+        lines.append(x)
+    return "\n".join(lines)
 
-    return text
+# =========================
+# Output formatter (요구 포맷 + 추가필드)
+# =========================
+def format_database(keyword_type: str, raw_text: str, original_link: str, leak_date: str) -> Dict[str, Any]:
+    return {
+        "id": str(uuid.uuid4()),
+        "keyword_type": keyword_type,
+        "source_id": "File",
+        "original_link": original_link,
+        "raw_text": raw_text,
+        "leak_date": str(leak_date),
+    }
 
-
-# -------------------------
-# Public API: main.py에서 부를 함수
-# -------------------------
-def analyze_bytes(
-    file_bytes: bytes,
+# =========================
+# Public API: analyze_text
+# =========================
+def analyze_text(
+    text: str,
     filename: str,
     leak_date: Optional[str] = None,
-    mask: bool = True,
-    max_text_chars: int = 2_000_000,
+    mask: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """
-    FastAPI에서 업로드 받은 bytes를 넣으면,
-    표준 포맷(list[dict])으로 결과를 반환.
+    main.py에서 호출:
+      results = analyze_text(text, filename=file.filename, leak_date=..., mask=...)
+    반환: ES에 그대로 넣을 수 있는 dict 리스트(여러 건)
     """
     if leak_date is None:
         leak_date = utc_now_iso()
 
-    # decode (깨져도 진행)
-    text = file_bytes.decode("utf-8", errors="ignore")
-    if len(text) > max_text_chars:
-        text = text[:max_text_chars]
+    if mask is None:
+        mask = (DG_MASK_DEFAULT != "0")
 
-    ind = _extract_indicators(text)
-    keyword_types = _decide_keyword_types(ind)
+    # 분석용 원문(저장 전 마스킹/해싱은 선택)
+    ind = extract_indicators(text)
+    verdict = _score_page(text, ind)
 
-    if not keyword_types:
-        # 저장할 게 없으면 빈 리스트 반환(=ES 적재도 안함)
+    if not should_save_by_type(verdict):
         return []
 
-    # 근거(raw_text): “원문이 있다면 원문” 요구를 최대한 반영하되,
-    # 너무 길어지면 sample_lines + 요약으로 구성
-    evidence = []
-    evidence.append(f"[DeepGuardAnalyzer] filename={filename}")
-    evidence.append(f"- emails(unique)={ind.email_count}, creds_lines={ind.credentials}, tokens_lines={ind.tokens}, config_lines={ind.config}, infra_lines={ind.infra}, pii_lines={ind.pii}")
-    if ind.sample_lines:
-        evidence.append("\n[examples]")
-        evidence.extend(ind.sample_lines[:20])
+    # 여러 건으로 쪼개 저장: 기본은 "leak_type 1건" + (선택) examples N건
+    # - 최소 1건은 verdict를 대표로 저장
+    # - raw_text는 너무 길면 ES에 부담이니 적당히 자름
+    masked_text = apply_masking(text, enabled=mask)
 
-    # 원문 그대로 쓰고 싶다면 아래 주석 해제 가능(권장 X: 너무 큼)
-    # evidence.append("\n[raw_text_begin]\n" + text[:5000] + "\n[raw_text_end]")
+    base_raw = (masked_text[:4000]).strip()
+    if not base_raw:
+        base_raw = "(empty)"
 
-    raw_text = "\n".join(evidence)
-    if mask:
-        raw_text = _mask_text(raw_text)
+    rows: List[Dict[str, Any]] = []
 
-    # keyword_type 별로 “여러 건” 생성
-    out: List[Dict[str, Any]] = []
-    for kt in keyword_types:
-        out.append(format_database(
-            keyword_type=kt,
-            raw_text=raw_text,
-            filename=filename,
-            leak_date=leak_date
-        ))
-    return out
-
-
-def analyze_file_path(
-    file_path: str,
-    filename_for_link: Optional[str] = None,
-    leak_date: Optional[str] = None,
-    mask: bool = True
-) -> List[Dict[str, Any]]:
-    """
-    로컬 파일 경로로 분석할 때(테스트/CLI 용).
-    """
-    with open(file_path, "rb") as f:
-        b = f.read()
-    return analyze_bytes(
-        file_bytes=b,
-        filename=filename_for_link or file_path,
+    # 1) 대표 1건
+    doc = format_database(
+        keyword_type=verdict.leak_type,
+        raw_text=base_raw,
+        original_link=filename,
         leak_date=leak_date,
-        mask=mask
     )
+    # 부가 필드(ES 인덱싱/필터용)
+    doc.update({
+        "ts": utc_now_iso(),
+        "severity": verdict.severity,
+        "score": verdict.score,
+        "confidence": verdict.confidence,
+        "counts": verdict.signals.get("counts", {}),
+        "signals": {k: v for k, v in verdict.signals.items() if k != "counts"},
+    })
+    rows.append(doc)
+
+    # 2) example 라인들(있으면 추가로 여러 건 저장)
+    #    - 원하면 이 부분을 끄거나, max 개수를 줄일 수 있음
+    examples = ind.get("examples", []) or []
+    for ex in examples[:10]:
+        ex_text = apply_masking(ex, enabled=mask)
+        ex_doc = format_database(
+            keyword_type=f"{verdict.leak_type}_example",
+            raw_text=ex_text[:1000],
+            original_link=filename,
+            leak_date=leak_date,
+        )
+        ex_doc.update({
+            "ts": utc_now_iso(),
+            "severity": verdict.severity,
+            "score": verdict.score,
+            "confidence": verdict.confidence,
+        })
+        rows.append(ex_doc)
+
+    return rows
