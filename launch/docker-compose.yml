@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  # 1. 엘라스틱서치
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+    container_name: deepguard-elastic
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    networks:
+      - deepguard-net
+    volumes:
+      - elastic-data:/usr/share/elasticsearch/data
+
+  # 2. 키바나
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.1
+    container_name: deepguard-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - deepguard-net
+
+  # 3. 몽고DB
+  mongodb:
+    image: mongo:7.0
+    container_name: deepguard-mongo
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin123
+    networks:
+      - deepguard-net
+    volumes:
+      - mongo-data:/data/db
+
+  # 4. 백엔드 (FastAPI)
+  backend:
+    build: ./backend
+    container_name: deepguard-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - elasticsearch_url=http://elasticsearch:9200
+      - mongodb_url=mongodb://admin:admin123@mongodb:27017
+      - SMTP_SERVER=smtp.gmail.com
+      - SMTP_PORT=587
+      - SENDER_EMAIL=test@example.com
+      - SENDER_PASSWORD=dummy_password
+    depends_on:
+      - elasticsearch
+      - mongodb
+    networks:
+      - deepguard-net
+    env_file:
+      - ./backend/auth.env
+    volumes:
+      - ./backend:/app
+      
+
+  # 5. 크롤러 (철호님 파일)
+#  crawler:
+# build:
+#      context: ./crawler
+#      dockerfile: Dockerfile
+#    container_name: deepguard_crawl_b2b
+  #  environment:
+    #  - ELASTICSEARCH_URL=http://elasticsearch:9200
+      #- MONGODB_URL=mongodb://admin:admin123@mongodb:27017
+#    depends_on:
+  #    - elasticsearch
+   #   - mongodb
+  #  networks:
+    #  - deepguard-net
+
+  # 6. 프론트엔드 (React)
+  frontend:
+    build: ./front  # ★ 폴더명이 front라서 수정함
+    container_name: deepguard-frontend
+    ports:
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - backend
+    networks:
+      - deepguard-net
+
+networks:
+  deepguard-net:
+    driver: bridge
+
+volumes:
+  elastic-data:
+  mongo-data:

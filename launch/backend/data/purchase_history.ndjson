@@ -1,0 +1,20 @@
+{"User_ID":"gildong.hong","Product_Name":"Laptop","Price":1500000,"Purchase_Date":"2023-11-20","Payment_Method":"Card"}
+{"User_ID":"chulsoo.park","Product_Name":"Mouse","Price":35000,"Purchase_Date":"2023-11-21","Payment_Method":"Card"}
+{"User_ID":"younghee.kim","Product_Name":"Keyboard","Price":120000,"Purchase_Date":"2023-11-21","Payment_Method":"Card"}
+{"User_ID":"mina.yu","Product_Name":"Monitor","Price":450000,"Purchase_Date":"2023-11-22","Payment_Method":"Card"}
+{"User_ID":"gildong.hong","Product_Name":"USB Cable","Price":15000,"Purchase_Date":"2023-11-23","Payment_Method":"Cash"}
+{"User_ID":"sujin.kang","Product_Name":"Webcam","Price":95000,"Purchase_Date":"2023-11-23","Payment_Method":"Card"}
+{"User_ID":"younghee.kim","Product_Name":"Headset","Price":180000,"Purchase_Date":"2023-11-24","Payment_Method":"Card"}
+{"User_ID":"chulsoo.park","Product_Name":"SSD 500GB","Price":85000,"Purchase_Date":"2023-11-25","Payment_Method":"Transfer"}
+{"User_ID":"minho.lee","Product_Name":"Graphics Tablet","Price":320000,"Purchase_Date":"2023-11-25","Payment_Method":"Card"}
+{"User_ID":"jiwon.choi","Product_Name":"Laptop Stand","Price":55000,"Purchase_Date":"2023-11-26","Payment_Method":"Card"}
+{"User_ID":"gildong.hong","Product_Name":"Wireless Mouse","Price":65000,"Purchase_Date":"2023-11-27","Payment_Method":"Card"}
+{"User_ID":"mina.yu","Product_Name":"External HDD 2TB","Price":125000,"Purchase_Date":"2023-11-28","Payment_Method":"Card"}
+{"User_ID":"sujin.kang","Product_Name":"Mechanical Keyboard","Price":220000,"Purchase_Date":"2023-11-29","Payment_Method":"Card"}
+{"User_ID":"younghee.kim","Product_Name":"Desk Lamp","Price":45000,"Purchase_Date":"2023-11-30","Payment_Method":"Cash"}
+{"User_ID":"chulsoo.park","Product_Name":"Chair Cushion","Price":28000,"Purchase_Date":"2023-12-01","Payment_Method":"Card"}
+{"User_ID":"minho.lee","Product_Name":"USB Hub","Price":38000,"Purchase_Date":"2023-12-02","Payment_Method":"Card"}
+{"User_ID":"jiwon.choi","Product_Name":"Tablet","Price":850000,"Purchase_Date":"2023-12-03","Payment_Method":"Card"}
+{"User_ID":"gildong.hong","Product_Name":"Screen Cleaner","Price":12000,"Purchase_Date":"2023-12-04","Payment_Method":"Cash"}
+{"User_ID":"sujin.kang","Product_Name":"Bluetooth Speaker","Price":135000,"Purchase_Date":"2023-12-05","Payment_Method":"Card"}
+{"User_ID":"mina.yu","Product_Name":"Mouse Pad","Price":25000,"Purchase_Date":"2023-12-06","Payment_Method":"Card"}
